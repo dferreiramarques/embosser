@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Embosser — gerador de cunhos</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
+<style>
+:root{
+  --bg:#f4f2ee; --panel:#ffffff; --ink:#1d1f22; --muted:#6b6f76; --line:#e2dfd8;
+  --accent:#2f5d50; --accent-ink:#ffffff; --warn:#9a5b00; --warn-bg:#fff4e0;
+  --r:10px; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-size:14px}
+header{display:flex;align-items:baseline;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;margin:0;font-weight:650;letter-spacing:-.01em}
+header span{color:var(--muted);font-size:13px}
+.app{display:grid;grid-template-columns:340px 1fr;height:calc(100% - 50px)}
+aside{overflow:auto;border-right:1px solid var(--line);background:var(--panel);padding:8px 16px 24px}
+section.grp{border-bottom:1px solid var(--line);padding:12px 0}
+section.grp:last-child{border-bottom:0}
+section.grp h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 10px;font-weight:600}
+.row{display:grid;grid-template-columns:1fr 92px;gap:8px;align-items:center;margin:7px 0}
+.row label{font-size:13px}
+.row.wide{grid-template-columns:60px 1fr}
+.row small{display:block;color:var(--muted);font-size:11.5px;line-height:1.3}
+input[type=number],select{width:100%;padding:5px 7px;border:1px solid var(--line);border-radius:6px;font:inherit;background:#fff;color:var(--ink)}
+input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0 0}
+.full{grid-column:1/-1}
+.check{display:flex;gap:8px;align-items:center;margin:7px 0;font-size:13px}
+.check input{accent-color:var(--accent)}
+.btns{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:7px;padding:6px 10px;cursor:pointer}
+button:hover{border-color:#c9c5bc}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:600;padding:9px 12px;width:100%}
+button.primary:disabled{opacity:.5;cursor:default}
+.file{display:block;border:1px dashed #cfcbc2;border-radius:8px;padding:9px 10px;margin:6px 0;cursor:pointer;font-size:13px}
+.file:hover{border-color:var(--accent)}
+.file input{display:none}
+.file b{font-weight:600}
+.file .meta{color:var(--muted);font-size:12px;display:block;margin-top:2px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:4px 0 2px}
+.chips button{padding:3px 8px;font-size:12px;border-radius:99px}
+main{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px;min-height:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);display:flex;flex-direction:column;min-height:0;overflow:hidden}
+.card .bar{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid var(--line)}
+.card .bar h3{font-size:13px;margin:0;font-weight:600;flex:1}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.seg button{border:0;border-radius:0;padding:4px 9px;font-size:12px}
+.seg button[aria-pressed=true]{background:var(--ink);color:#fff}
+.view{position:relative;flex:1;min-height:0}
+canvas{display:block;width:100%;height:100%}
+#c2d{cursor:grab;touch-action:none}
+#c2d.drag{cursor:grabbing}
+.hint{position:absolute;left:10px;bottom:8px;font-size:11.5px;color:var(--muted);pointer-events:none}
+.busy{position:absolute;right:10px;top:10px;font-size:12px;background:rgba(255,255,255,.9);border:1px solid var(--line);border-radius:6px;padding:3px 8px;display:none}
+.stats{font-size:12px;color:var(--muted);line-height:1.6;margin-top:8px}
+.warn{background:var(--warn-bg);color:var(--warn);border-radius:7px;padding:7px 9px;font-size:12.5px;margin-top:8px;display:none}
+.err{background:#fdecec;color:#9b1c1c}
+.note{font-size:12px;color:var(--muted);line-height:1.45;margin-top:8px}
+.empty{position:absolute;inset:0;display:none;align-items:center;justify-content:center;text-align:center;color:var(--muted);padding:20px;font-size:13px}
+@media (max-width: 1100px){ main{grid-template-columns:1fr;grid-auto-rows:minmax(340px,1fr)} }
+@media (max-width: 760px){ .app{grid-template-columns:1fr;height:auto} aside{border-right:0} main{grid-auto-rows:360px} }
+</style>
+</head>
+<body>
+<header><h1>Embosser</h1><span>Medalha + vetor → cunho positivo e negativo com tolerâncias</span></header>
+<div class="app">
+<aside>
+  <section class="grp">
+    <h2>Ficheiros</h2>
+    <label class="file"><input type="file" id="fSTL" accept=".stl"><b>Medalha (STL)</b><span class="meta" id="mSTL">—</span></label>
+    <label class="file"><input type="file" id="fDXF" accept=".dxf,.svg"><b>Arte (DXF ou SVG)</b><span class="meta" id="mDXF">—</span></label>
+    <div class="row"><label for="medalRot">Rodar medalha (°)</label><input type="number" id="medalRot" step="15"></div>
+    <div class="btns"><button data-mrot="-90">↺ 90°</button><button data-mrot="90">↻ 90°</button><button data-mrot="180">180°</button></div>
+  </section>
+
+  <section class="grp">
+    <h2>Arte</h2>
+    <div class="row"><label for="artWidth">Largura (mm)</label><input type="number" id="artWidth" step="0.5" min="1"></div>
+    <div class="btns"><button id="bFit" title="Maior tamanho que cabe dentro da margem">Ajustar à medalha</button><button id="bCenter">Centrar</button></div>
+    <div class="row"><label for="rotation">Rotação (°)</label><input type="number" id="rotation" step="1"></div>
+    <input type="range" id="rotationR" min="-180" max="180" step="1" aria-label="Rotação">
+    <div class="row"><label for="offX">Posição X / Y (mm)</label><div style="display:flex;gap:4px"><input type="number" id="offX" step="0.5"><input type="number" id="offY" step="0.5" aria-label="Posição Y"></div></div>
+    <div class="row"><label for="margin">Margem à borda (mm)</label><input type="number" id="margin" step="0.5" min="0"></div>
+    <div class="row"><label for="fillRule">Preenchimento<small id="fillNote">Como interpretar contornos dentro de contornos</small></label><select id="fillRule"><option value="evenodd">Alternado</option><option value="nonzero">Tudo cheio</option></select></div>
+    <div class="row"><label for="stroke">Engrossar traço (mm)<small>+ engrossa, − afina</small></label><input type="number" id="stroke" step="0.05"></div>
+    <label class="check"><input type="checkbox" id="invert"> Inverter (fundo em relevo, desenho afundado)</label>
+    <label class="check"><input type="checkbox" id="mirrorArt"> Espelhar arte</label>
+  </section>
+
+  <section class="grp">
+    <h2>Moldura</h2>
+    <div class="row wide"><label for="frameType">Tipo</label><select id="frameType"></select></div>
+    <div class="frameOpts">
+      <div class="row"><label for="frameRot">Rotação (°)</label><input type="number" id="frameRot" step="1"></div>
+      <input type="range" id="frameRotR" min="-180" max="180" step="1" aria-label="Rotação da moldura">
+      <div class="row"><label for="frameR">Raio exterior (mm)<small>0 = o maior que cabe</small></label><input type="number" id="frameR" step="0.5" min="0"></div>
+      <div class="row"><label for="frameSize">Tamanho (mm)<small>Espessura da linha ou dos elementos · 0 = auto</small></label><input type="number" id="frameSize" step="0.1" min="0"></div>
+      <div class="row"><label for="frameCount">Quantidade<small>Pontos, estrelas, folhas… · 0 = auto</small></label><input type="number" id="frameCount" step="1" min="0"></div>
+      <div class="row"><label for="frameGap">Espaço até à arte (mm)</label><input type="number" id="frameGap" step="0.2" min="0"></div>
+      <label class="check"><input type="checkbox" id="frameLines"> Linha fina por fora dos elementos</label>
+      <label class="check"><input type="checkbox" id="frameClip"> Cortar a arte dentro da moldura</label>
+    </div>
+  </section>
+
+  <section class="grp">
+    <h2>Relevo e tolerâncias</h2>
+    <div class="row"><label for="reliefH">Altura do relevo (mm)</label><input type="number" id="reliefH" step="0.05" min="0.1"></div>
+    <div class="row"><label for="paper">Espessura do papel (mm)</label><input type="number" id="paper" step="0.01" min="0"></div>
+    <div class="chips"><button data-paper="0.10">80 g · 0,10</button><button data-paper="0.15">120 g · 0,15</button><button data-paper="0.22">200 g · 0,22</button><button data-paper="0.30">300 g · 0,30</button></div>
+    <div class="row"><label for="clearance">Folga de impressão (mm)<small>Somada ao papel em cada lado</small></label><input type="number" id="clearance" step="0.05" min="0"></div>
+    <div class="row"><label for="draftDeg">Ângulo de saída (°)<small>Paredes inclinadas: auto-centra e solta o papel</small></label><input type="number" id="draftDeg" step="1" min="0" max="40"></div>
+    <div class="row"><label for="steps">Degraus da saída<small>≈ altura ÷ altura de camada</small></label><input type="number" id="steps" step="1" min="1" max="12"></div>
+    <div class="row"><label for="extraDepth">Profundidade extra (mm)<small>Cavidade mais funda que o relevo</small></label><input type="number" id="extraDepth" step="0.05" min="0"></div>
+    <div class="row"><label for="baseT">Espessura da base (mm)<small>0 = a da medalha</small></label><input type="number" id="baseT" step="0.5" min="0"></div>
+    <div class="row"><label for="rim">Parede mínima no negativo (mm)</label><input type="number" id="rim" step="0.1" min="0.4"></div>
+    <div class="row"><label for="gap">Distância entre peças (mm)</label><input type="number" id="gap" step="1" min="2"></div>
+  </section>
+
+  <section class="grp">
+    <h2>Exportar</h2>
+    <button class="primary" id="bExport" disabled>Descarregar STL</button>
+    <div class="stats" id="stats"></div>
+    <div class="warn" id="warn"></div>
+    <p class="note">Com «Espelhar arte» ligado (por defeito), o positivo sai espelhado e a cavidade do negativo fica igual ao desenho original. Imprime ambos de face para cima. Para usar: vira o negativo como a página de um livro e alinha os entalhes da borda — o relevo no papel fica legível do lado da cavidade.</p>
+  </section>
+</aside>
+
+<main>
+  <div class="card">
+    <div class="bar"><h3>Desenho</h3>
+      <div class="seg" id="seg2d"><button data-v="male" aria-pressed="true">Positivo</button><button data-v="female" aria-pressed="false">Negativo</button></div>
+    </div>
+    <div class="view"><canvas id="c2d"></canvas><div class="hint" id="hint2d">Arrasta para mover · roda para escalar · Shift + roda para rodar</div><div class="empty" id="empty2d">Carrega uma medalha (STL) e uma arte (DXF) para começar.</div></div>
+  </div>
+  <div class="card">
+    <div class="bar"><h3>Peças 3D</h3>
+      <div class="seg" id="seg3d"><button data-v="both" aria-pressed="true">Ambas</button><button data-v="male" aria-pressed="false">Positivo</button><button data-v="female" aria-pressed="false">Negativo</button><button data-v="fit" aria-pressed="false">Encaixe</button></div>
+    </div>
+    <div class="view" id="v3d"><div class="busy" id="busy">A gerar…</div></div>
+  </div>
+</main>
+</div>
+
+<script id="core">/*__CORE__*/</script>
+<script>
+(() => {
+const C = window.EmbosserCore;
+const $ = id => document.getElementById(id);
+const P = Object.assign({}, C.DEFAULTS);
+let baseMedal = null, medal = null, loops = null, medalName = 'medalha', artName = 'arte';
+let result = null, art2d = null, view2d = 'male', view3d = 'both';
+
+/* ---------- controlos ---------- */
+const numIds = ['medalRot','artWidth','rotation','offX','offY','margin','stroke','frameRot','frameR','frameSize','frameCount','frameGap','reliefH','paper','clearance','draftDeg','steps','extraDepth','baseT','rim','gap'];
+function syncUI() {
+  for (const id of numIds) $(id).value = +(+P[id]).toFixed(3);
+  $('rotationR').value = P.rotation; $('frameRotR').value = P.frameRot; $('fillRule').value = P.fillRule;
+  $('invert').checked = P.invert; $('mirrorArt').checked = P.mirrorArt;
+  $('frameType').value = P.frameType; $('frameLines').checked = P.frameLines; $('frameClip').checked = P.frameClip;
+  document.querySelector('.frameOpts').style.display = P.frameType === 'none' ? 'none' : 'block';
+}
+for (const [k, v] of Object.entries(C.FRAME_TYPES)) { const o = document.createElement('option'); o.value = k; o.textContent = v.label; $('frameType').appendChild(o); }
+// se a arte deixar de caber (moldura nova/maior), encolhe-a para caber
+function keepArtInside() {
+  if (!medal || !loops) return;
+  const fit = C.fitWidth(medal, loops, P);
+  if (P.artWidth > fit) { P.artWidth = Math.floor(fit * 0.98 * 10) / 10; syncUI(); }
+}
+$('frameType').addEventListener('change', e => { P.frameType = e.target.value; P.frameSize = 0; P.frameCount = 0; keepArtInside(); syncUI(); changed(); });
+$('frameLines').addEventListener('change', e => { P.frameLines = e.target.checked; keepArtInside(); changed(); });
+$('frameClip').addEventListener('change', e => { P.frameClip = e.target.checked; changed(); });
+for (const id of ['frameR', 'frameSize', 'frameGap']) $(id).addEventListener('change', () => { keepArtInside(); changed(); });
+for (const id of numIds) $(id).addEventListener('input', e => { const v = parseFloat(e.target.value); if (!isNaN(v)) { P[id] = v; if (id === 'rotation') $('rotationR').value = v; if (id === 'frameRot') $('frameRotR').value = v; if (id === 'medalRot') applyMedalRot(); changed(); } });
+$('frameRotR').addEventListener('input', e => { P.frameRot = +e.target.value; $('frameRot').value = P.frameRot; changed(); });
+document.querySelectorAll('[data-mrot]').forEach(b => b.addEventListener('click', () => { let r = (P.medalRot || 0) + (+b.dataset.mrot); r = ((r + 540) % 360) - 180; P.medalRot = r; syncUI(); applyMedalRot(); changed(); }));
+function applyMedalRot() { if (baseMedal) { medal = C.rotateMedal(baseMedal, P.medalRot || 0); keepArtInside(); } }
+$('rotationR').addEventListener('input', e => { P.rotation = +e.target.value; $('rotation').value = P.rotation; changed(); });
+$('fillRule').addEventListener('change', e => { P.fillRule = e.target.value; changed(); });
+$('invert').addEventListener('change', e => { P.invert = e.target.checked; changed(); });
+$('mirrorArt').addEventListener('change', e => { P.mirrorArt = e.target.checked; changed(); });
+document.querySelectorAll('[data-paper]').forEach(b => b.addEventListener('click', () => { P.paper = +b.dataset.paper; syncUI(); changed(); }));
+$('bFit').addEventListener('click', () => { if (!medal || !loops) return; P.artWidth = Math.floor(C.fitWidth(medal, loops, P) * 0.98 * 10) / 10; syncUI(); changed(); });
+$('bCenter').addEventListener('click', () => { P.offX = 0; P.offY = 0; syncUI(); changed(); });
+function segInit(id, cb) {
+  const btns = $(id).querySelectorAll('button');
+  btns.forEach(b => b.addEventListener('click', () => { btns.forEach(x => x.setAttribute('aria-pressed', x === b)); cb(b.dataset.v); }));
+}
+segInit('seg2d', v => { view2d = v; draw2d(); });
+segInit('seg3d', v => { view3d = v; show3d(true); });
+
+/* ---------- ficheiros ---------- */
+function setMedal(buf, name) {
+  baseMedal = C.medalFromSTL(buf); medal = C.rotateMedal(baseMedal, P.medalRot || 0); medalName = name.replace(/\.stl$/i, '');
+  $('mSTL').textContent = `${name} · ${baseMedal.width.toFixed(1)} × ${baseMedal.height.toFixed(1)} × ${baseMedal.thickness.toFixed(1)} mm`;
+}
+function setArt(text, name) {
+  loops = C.parseArt(text, name); artName = name.replace(/\.(dxf|svg)$/i, '');
+  const b = C.artBounds(loops);
+  const isSVG = !!loops.groups;
+  $('fillRule').disabled = isSVG;
+  $('fillNote').textContent = isSVG ? 'No SVG vale a regra de cada elemento' : 'Como interpretar contornos dentro de contornos';
+  $('mDXF').textContent = `${name} · ${loops.length} contornos · ${b.w.toFixed(1)} × ${b.h.toFixed(1)} (unid. do desenho)`;
+}
+function autoFit() { if (medal && loops) { P.artWidth = Math.floor(C.fitWidth(medal, loops, P) * 0.92 * 10) / 10; P.offX = P.offY = 0; syncUI(); } }
+$('fSTL').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { setMedal(await f.arrayBuffer(), f.name); autoFit(); changed(); } catch (err) { showError(err.message); }
+});
+$('fDXF').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  try { setArt(await f.text(), f.name); autoFit(); changed(); } catch (err) { showError(err.message); }
+});
+function showError(msg) { const w = $('warn'); w.textContent = msg; w.classList.add('err'); w.style.display = 'block'; }
+
+/* ---------- 2D ---------- */
+const cv = $('c2d'), ctx = cv.getContext('2d');
+let tf = { s: 1, ox: 0, oy: 0 };
+function resize2d() { const r = cv.getBoundingClientRect(), d = devicePixelRatio || 1; cv.width = r.width * d; cv.height = r.height * d; draw2d(); }
+new ResizeObserver(resize2d).observe(cv);
+function pathTo(paths, mir) {
+  ctx.beginPath();
+  for (const p of paths) {
+    p.forEach((pt, i) => { const x = (mir ? -pt.X : pt.X) / C.S, y = pt.Y / C.S; const sx = tf.ox + x * tf.s, sy = tf.oy - y * tf.s; i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); });
+    ctx.closePath();
+  }
+}
+function draw2d() {
+  const W = cv.width, H = cv.height, d = devicePixelRatio || 1;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, W, H);
+  $('empty2d').style.display = medal && loops ? 'none' : 'flex';
+  $('hint2d').style.display = medal && loops ? 'block' : 'none';
+  if (!medal) return;
+  const span = Math.max(medal.width, medal.height) * 1.12;
+  tf.s = Math.min(W, H) / span; tf.ox = W / 2; tf.oy = H / 2;
+  const mir = view2d === 'female';
+  pathTo(medal.paths, mir); ctx.fillStyle = mir ? '#e6e1d6' : '#ece8df'; ctx.fill('evenodd');
+  ctx.lineWidth = 1.2 * d; ctx.strokeStyle = '#9c968a'; ctx.stroke();
+  ctx.setLineDash([4 * d, 4 * d]); ctx.lineWidth = d; ctx.strokeStyle = '#b8b2a6';
+  pathTo(C.offset(medal.paths, -P.margin), mir); ctx.stroke(); ctx.setLineDash([]);
+  if (!art2d) return;
+  if (!mir) {
+    pathTo(art2d, false); ctx.fillStyle = '#23262b'; ctx.fill('evenodd');
+  } else {
+    const pocket = C.offset(art2d, P.paper + P.clearance);
+    pathTo(pocket, true); ctx.fillStyle = '#4b4f57'; ctx.fill('evenodd');
+    pathTo(art2d, true); ctx.lineWidth = 0.8 * d; ctx.strokeStyle = 'rgba(255,255,255,.55)'; ctx.stroke();
+  }
+  ctx.fillStyle = '#6b6f76'; ctx.font = `${11 * d}px system-ui`;
+  ctx.fillText(mir ? 'Negativo (cavidade, espelhado) — vista de cima' : 'Positivo (relevo) — vista de cima', 10 * d, 18 * d);
+}
+let drag = null;
+cv.addEventListener('pointerdown', e => { if (!medal || !loops) return; drag = { x: e.clientX, y: e.clientY, ox: P.offX, oy: P.offY }; cv.setPointerCapture(e.pointerId); cv.classList.add('drag'); });
+cv.addEventListener('pointermove', e => {
+  if (!drag) return; const d = devicePixelRatio || 1;
+  const dx = (e.clientX - drag.x) * d / tf.s, dy = (e.clientY - drag.y) * d / tf.s;
+  P.offX = +(drag.ox + (view2d === 'female' ? -dx : dx)).toFixed(2); P.offY = +(drag.oy - dy).toFixed(2);
+  $('offX').value = P.offX; $('offY').value = P.offY; changed(true);
+});
+const endDrag = () => { if (drag) { drag = null; cv.classList.remove('drag'); changed(); } };
+cv.addEventListener('pointerup', endDrag); cv.addEventListener('pointercancel', endDrag);
+cv.addEventListener('wheel', e => {
+  if (!medal || !loops) return; e.preventDefault();
+  if (e.shiftKey) { P.rotation = Math.round(P.rotation + (e.deltaY > 0 ? 2 : -2)); if (P.rotation > 180) P.rotation -= 360; if (P.rotation < -180) P.rotation += 360; }
+  else P.artWidth = Math.max(1, +(P.artWidth * (e.deltaY > 0 ? 0.97 : 1.03)).toFixed(2));
+  syncUI(); changed();
+}, { passive: false });
+
+/* ---------- 3D ---------- */
+const host = $('v3d');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio || 1); renderer.setClearColor(0xf7f6f3);
+host.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.5, 2000);
+camera.up.set(0, 0, 1);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x8a8577, 0.75));
+const dl = new THREE.DirectionalLight(0xffffff, 0.75); dl.position.set(-60, -90, 160); scene.add(dl);
+const dl2 = new THREE.DirectionalLight(0xffffff, 0.25); dl2.position.set(80, 60, 60); scene.add(dl2);
+const grp = new THREE.Group(); scene.add(grp);
+const matM = new THREE.MeshStandardMaterial({ color: 0xc9c2b2, roughness: 0.65, metalness: 0.05 });
+const matF = new THREE.MeshStandardMaterial({ color: 0x8fa79e, roughness: 0.65, metalness: 0.05 });
+function meshOf(arr, mat) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(arr, 3));
+  g.computeVertexNormals();
+  return new THREE.Mesh(g, mat);
+}
+function resize3d() { const r = host.getBoundingClientRect(); renderer.setSize(r.width, r.height, false); renderer.domElement.style.width = '100%'; renderer.domElement.style.height = '100%'; camera.aspect = r.width / Math.max(1, r.height); camera.updateProjectionMatrix(); }
+new ResizeObserver(resize3d).observe(host);
+let lastFrameKey = '';
+function show3d(reframe) {
+  while (grp.children.length) { const m = grp.children.pop(); m.geometry.dispose(); }
+  if (!result) return;
+  const st = result.stats, W = medal.width;
+  if (view3d === 'both') { grp.add(meshOf(result.male, matM)); grp.add(meshOf(result.female, matF)); }
+  else if (view3d === 'male') grp.add(meshOf(result.maleLocal, matM));
+  else if (view3d === 'female') grp.add(meshOf(result.femaleLocal, matF));
+  else { // encaixe: negativo virado (eixo Y) por cima do positivo, aberto 4 mm
+    grp.add(meshOf(result.maleLocal, matM));
+    const f = meshOf(result.femaleLocal, matF);
+    f.rotation.y = Math.PI; f.position.z = st.T * 2 + st.h + 4 + P.paper;
+    grp.add(f);
+  }
+  const key = view3d;
+  if (reframe || key !== lastFrameKey) {
+    const box = new THREE.Box3().setFromObject(grp), c = box.getCenter(new THREE.Vector3()), sz = box.getSize(new THREE.Vector3());
+    const vf = camera.fov * Math.PI / 180, hf = 2 * Math.atan(Math.tan(vf / 2) * camera.aspect);
+    const R = (sz.length() / 2) / Math.sin(Math.min(vf, hf) / 2) * 1.02;
+    controls.target.copy(c); camera.position.set(c.x, c.y - R * 0.85, c.z + R * 0.75); controls.update();
+    lastFrameKey = key;
+  }
+}
+(function loop() { requestAnimationFrame(loop); controls.update(); renderer.render(scene, camera); })();
+
+/* ---------- reconstrução ---------- */
+let t3 = null;
+function changed(light) {
+  if (!medal || !loops) { draw2d(); return; }
+  try { art2d = C.buildArtRegion(medal, loops, P); } catch (e) { art2d = null; }
+  draw2d();
+  if (light) return;
+  clearTimeout(t3); $('busy').style.display = 'block';
+  t3 = setTimeout(rebuild3d, 250);
+}
+/* geração 3D num Web Worker: a interface nunca congela. Sem worker → corre na página. */
+let worker = null, reqId = 0, pending = new Map(), busyPreview = false, queuedPreview = false;
+try {
+  const srcOf = k => document.querySelector(`script[src*="${k}"]`).src;
+  const code = `importScripts(${JSON.stringify(srcOf('clipper'))}, ${JSON.stringify(srcOf('earcut'))});\n` +
+    document.getElementById('core').textContent + `
+    self.onmessage = e => {
+      const d = e.data;
+      try {
+        if (d.groups) d.loops.groups = d.groups;
+        const r = self.EmbosserCore.build(d.medal, d.loops, d.P, { preview: d.preview });
+        const out = { id: d.id, male: r.male, female: r.female, maleLocal: r.maleLocal, femaleLocal: r.femaleLocal, stats: r.stats, warnings: r.warnings };
+        self.postMessage(out, [out.male.buffer, out.female.buffer, out.maleLocal.buffer, out.femaleLocal.buffer]);
+      } catch (err) { self.postMessage({ id: d.id, error: String(err && err.message || err) }); }
+    };`;
+  worker = new Worker(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
+  worker.onmessage = e => { const cb = pending.get(e.data.id); pending.delete(e.data.id); if (cb) cb(e.data); };
+  worker.onerror = () => { worker = null; for (const cb of pending.values()) cb(null); pending.clear(); };
+} catch (e) { worker = null; }
+
+function runBuild(preview) {
+  const P2 = JSON.parse(JSON.stringify(P));
+  if (worker) {
+    return new Promise(res => {
+      const id = ++reqId;
+      pending.set(id, d => {
+        if (d === null) res(runLocal(P2, preview)); // worker falhou → faz na página
+        else if (d.error) res({ error: d.error }); else res(d);
+      });
+      worker.postMessage({ id, medal, loops: loops.map(l => l), groups: loops.groups || null, P: P2, preview });
+    });
+  }
+  return new Promise(res => setTimeout(() => res(runLocal(P2, preview)), 20));
+}
+function runLocal(P2, preview) { try { return C.build(medal, loops, P2, { preview }); } catch (e) { return { error: e.message }; } }
+
+async function rebuild3d() {
+  if (busyPreview) { queuedPreview = true; return; }
+  busyPreview = true; $('busy').style.display = 'block';
+  const r = await runBuild(true);
+  busyPreview = false;
+  if (queuedPreview) { queuedPreview = false; rebuild3d(); return; }
+  $('busy').style.display = 'none';
+  if (r.error) { showError('Erro ao gerar: ' + r.error); return; }
+  result = r;
+  const s = r.stats;
+  $('stats').innerHTML = `Base ${s.T.toFixed(1)} mm · relevo ${s.h.toFixed(2)} mm · cavidade ${s.D.toFixed(2)} mm<br>Cavidade = arte + ${s.c.toFixed(2)} mm por lado (papel ${P.paper.toFixed(2)} + folga ${P.clearance.toFixed(2)})<br>Espaços interiores preservados no negativo: ${s.holesArt - s.holesClosed} de ${s.holesArt}<br>Pré-visualização simplificada (máx. 2 degraus); o STL exportado sai completo.`;
+  const w = $('warn'); w.classList.remove('err');
+  if (r.warnings.length) { w.innerHTML = r.warnings.join('<br>'); w.style.display = 'block'; } else w.style.display = 'none';
+  $('bExport').disabled = false;
+  show3d(false);
+}
+
+/* ---------- exportar ---------- */
+let downloads = null;
+if (window.claude && window.claude.use) window.claude.use('downloads').then(d => { downloads = d; updateExportLabel(); }).catch(() => {});
+function updateExportLabel() { $('bExport').textContent = downloads ? 'Descarregar STL (.zip)' : 'Descarregar STL'; }
+updateExportLabel();
+$('bExport').addEventListener('click', async () => {
+  if (!medal || !loops) return;
+  const btn = $('bExport'); btn.disabled = true; btn.textContent = 'A preparar STL completo…';
+  const full = await runBuild(false);
+  btn.disabled = false; updateExportLabel();
+  if (full.error) { showError('Erro ao gerar: ' + full.error); return; }
+  const base = `embosser_${artName}`.replace(/[^\w\-]+/g, '_');
+  const both = C.toSTL([full.male, full.female], 'Embosser - positivo + negativo');
+  if (downloads) {
+    const z = C.zip([
+      { name: base + '_positivo_e_negativo.stl', data: both },
+      { name: base + '_positivo.stl', data: C.toSTL([full.maleLocal], 'Embosser - positivo') },
+      { name: base + '_negativo.stl', data: C.toSTL([full.femaleLocal], 'Embosser - negativo') },
+      { name: 'parametros.json', data: new TextEncoder().encode(JSON.stringify(P, null, 2)) }
+    ]);
+    try { await downloads.save({ filename: base + '.zip', data: new Blob([z]) }); }
+    catch (e) { if (e && e.code !== 'declined') showError('Não foi possível guardar: ' + (e.message || e.code)); }
+  } else {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([both], { type: 'model/stl' }));
+    a.download = base + '_positivo_e_negativo.stl'; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+});
+
+/* ---------- arranque ---------- */
+syncUI();
+(async () => {
+  try {
+    const r = await fetch('exemplo.json');
+    if (r.ok) {
+      const ex = await r.json();
+      const bin = atob(ex.stl), u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      setMedal(u8.buffer, ex.stlName); setArt(ex.dxf, ex.dxfName); autoFit();
+    }
+  } catch (e) { /* sem ficheiros de exemplo: o utilizador carrega os seus */ }
+  changed();
+})();
+})();
+</script>
+</body>
+</html>

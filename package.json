@@ -1,0 +1,11 @@
+{
+  "name": "embosser",
+  "version": "1.0.0",
+  "description": "Embosser — gerador de cunhos de selo branco (positivo + negativo) a partir de uma medalha STL e de uma arte DXF",
+  "private": true,
+  "scripts": {
+    "build": "python3 tools/build.py",
+    "exemplo": "node tools/gerar.js exemplo/medalha.stl exemplo/estrela.dxf exemplo/embosser_estrela.stl"
+  },
+  "dependencies": { "clipper-lib": "6.4.2", "earcut": "2.2.4" }
+}

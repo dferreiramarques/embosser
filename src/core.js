@@ -1,0 +1,964 @@
+/* EmbosserCore — motor geométrico do Embosser.
+   Lê medalha (STL extrudido) + arte (DXF), constrói positivo e negativo
+   com tolerâncias e devolve triângulos prontos para STL. */
+(function (root, factory) {
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = factory(require('clipper-lib'), require('earcut'));
+  } else {
+    root.EmbosserCore = factory(root.ClipperLib, root.earcut);
+  }
+})(typeof self !== 'undefined' ? self : this, function (ClipperLib, earcut) {
+  'use strict';
+  const S = 1000; // 1 unidade clipper = 1 µm
+  const ARC_TOL = 0.02 * S; // 20 µm: abaixo da resolução de impressão, muito menos vértices
+
+  /* ---------------- DXF ---------------- */
+  function parseDXF(text) {
+    const lines = text.split(/\r?\n/);
+    const pairs = [];
+    for (let i = 0; i + 1 < lines.length; i += 2) {
+      pairs.push([parseInt(lines[i].trim(), 10), lines[i + 1].trim()]);
+    }
+    // isolar secção ENTITIES
+    let start = -1, end = pairs.length;
+    for (let i = 0; i < pairs.length - 1; i++) {
+      if (pairs[i][0] === 0 && pairs[i][1] === 'SECTION' && pairs[i + 1][0] === 2 && pairs[i + 1][1] === 'ENTITIES') { start = i + 2; }
+      else if (start >= 0 && pairs[i][0] === 0 && pairs[i][1] === 'ENDSEC') { end = i; break; }
+    }
+    if (start < 0) throw new Error('DXF sem secção ENTITIES');
+    const ents = [];
+    let cur = null;
+    for (let i = start; i < end; i++) {
+      const [c, v] = pairs[i];
+      if (c === 0) { cur = { type: v, d: [] }; ents.push(cur); }
+      else if (cur) cur.d.push([c, v]);
+    }
+    const closed = [], open = [];
+    const get = (e, code) => { const p = e.d.find(x => x[0] === code); return p ? parseFloat(p[1]) : undefined; };
+    const all = (e, code) => e.d.filter(x => x[0] === code).map(x => parseFloat(x[1]));
+    const inPaper = e => get(e, 67) === 1;
+
+    for (let i = 0; i < ents.length; i++) {
+      const e = ents[i];
+      if (inPaper(e)) continue;
+      switch (e.type) {
+        case 'SPLINE': {
+          const pts = sampleSpline(e);
+          if (pts.length < 2) break;
+          const flag = get(e, 70) || 0;
+          if ((flag & 1) || dist(pts[0], pts[pts.length - 1]) < 1e-6) closed.push(dedupe(pts));
+          else open.push(pts);
+          break;
+        }
+        case 'LWPOLYLINE': {
+          const flag = get(e, 70) || 0;
+          const verts = []; let last = null;
+          for (const [c, v] of e.d) {
+            if (c === 10) { last = { x: +v, y: 0, b: 0 }; verts.push(last); }
+            else if (c === 20 && last) last.y = +v;
+            else if (c === 42 && last) last.b = +v;
+          }
+          const pts = bulgePath(verts, !!(flag & 1));
+          if ((flag & 1) || (pts.length > 2 && dist(pts[0], pts[pts.length - 1]) < 1e-6)) closed.push(dedupe(pts)); else open.push(pts);
+          break;
+        }
+        case 'POLYLINE': {
+          const flag = get(e, 70) || 0;
+          const verts = [];
+          let j = i + 1;
+          for (; j < ents.length && ents[j].type === 'VERTEX'; j++) {
+            verts.push({ x: get(ents[j], 10), y: get(ents[j], 20), b: get(ents[j], 42) || 0 });
+          }
+          i = j; // salta SEQEND
+          const pts = bulgePath(verts, !!(flag & 1));
+          if (flag & 1) closed.push(dedupe(pts)); else open.push(pts);
+          break;
+        }
+        case 'CIRCLE': {
+          const cx = get(e, 10), cy = get(e, 20), r = get(e, 40);
+          closed.push(arcPts(cx, cy, r, 0, Math.PI * 2, true));
+          break;
+        }
+        case 'ARC': {
+          const cx = get(e, 10), cy = get(e, 20), r = get(e, 40);
+          let a0 = get(e, 50) * Math.PI / 180, a1 = get(e, 51) * Math.PI / 180;
+          if (a1 <= a0) a1 += Math.PI * 2;
+          open.push(arcPts(cx, cy, r, a0, a1, false));
+          break;
+        }
+        case 'ELLIPSE': {
+          const cx = get(e, 10), cy = get(e, 20), mx = get(e, 11), my = get(e, 21), ratio = get(e, 40);
+          let t0 = get(e, 41) || 0, t1 = get(e, 42); if (t1 === undefined) t1 = Math.PI * 2;
+          if (t1 <= t0) t1 += Math.PI * 2;
+          const n = Math.max(24, Math.ceil((t1 - t0) / (Math.PI * 2) * 128));
+          const pts = [];
+          for (let k = 0; k <= n; k++) {
+            const t = t0 + (t1 - t0) * k / n;
+            pts.push({ x: cx + mx * Math.cos(t) - my * ratio * Math.sin(t), y: cy + my * Math.cos(t) + mx * ratio * Math.sin(t) });
+          }
+          if (Math.abs(t1 - t0 - Math.PI * 2) < 1e-6) closed.push(dedupe(pts)); else open.push(pts);
+          break;
+        }
+        case 'LINE': {
+          open.push([{ x: get(e, 10), y: get(e, 20) }, { x: get(e, 11), y: get(e, 21) }]);
+          break;
+        }
+      }
+    }
+    // encadear caminhos abertos
+    const chained = chainOpen(open);
+    for (const c of chained) closed.push(dedupe(c));
+    const loops = closed.filter(l => l.length >= 3);
+    if (!loops.length) throw new Error('Não encontrei contornos fechados no DXF (SPLINE, LWPOLYLINE, POLYLINE, CIRCLE, ELLIPSE, LINE/ARC).');
+    return loops;
+  }
+
+  function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+  function dedupe(pts) {
+    const out = [];
+    for (const p of pts) if (!out.length || dist(out[out.length - 1], p) > 1e-7) out.push(p);
+    if (out.length > 1 && dist(out[0], out[out.length - 1]) < 1e-7) out.pop();
+    return out;
+  }
+  function arcPts(cx, cy, r, a0, a1, full) {
+    const n = Math.max(12, Math.ceil(Math.abs(a1 - a0) / (Math.PI * 2) * 96));
+    const pts = [];
+    for (let k = 0; k <= n; k++) { if (full && k === n) break; const a = a0 + (a1 - a0) * k / n; pts.push({ x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) }); }
+    return pts;
+  }
+  function bulgePath(verts, closed) {
+    const pts = [];
+    const n = verts.length;
+    const segs = closed ? n : n - 1;
+    for (let i = 0; i < segs; i++) {
+      const a = verts[i], b = verts[(i + 1) % n];
+      pts.push({ x: a.x, y: a.y });
+      if (Math.abs(a.b) > 1e-9) {
+        const theta = 4 * Math.atan(a.b);
+        const d = Math.hypot(b.x - a.x, b.y - a.y);
+        if (d < 1e-12) continue;
+        const r = d / (2 * Math.sin(theta / 2));
+        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+        const h = r * Math.cos(theta / 2);
+        const nx = -(b.y - a.y) / d, ny = (b.x - a.x) / d;
+        const cx = mx + nx * h, cy = my + ny * h;
+        const a0 = Math.atan2(a.y - cy, a.x - cx);
+        const steps = Math.max(4, Math.ceil(Math.abs(theta) / (Math.PI * 2) * 96));
+        const rr = Math.abs(r);
+        for (let k = 1; k < steps; k++) {
+          const t = a0 + theta * k / steps;
+          pts.push({ x: cx + rr * Math.cos(t), y: cy + rr * Math.sin(t) });
+        }
+      }
+    }
+    if (!closed && n) pts.push({ x: verts[n - 1].x, y: verts[n - 1].y });
+    return pts;
+  }
+  function sampleSpline(e) {
+    const deg = parseInt((e.d.find(x => x[0] === 71) || [0, 3])[1], 10);
+    const knots = [], ctrl = [], w = [], fit = [];
+    let lastC = null, lastF = null;
+    for (const [c, v] of e.d) {
+      if (c === 40) knots.push(+v);
+      else if (c === 41) w.push(+v);
+      else if (c === 10) { lastC = { x: +v, y: 0 }; ctrl.push(lastC); }
+      else if (c === 20 && lastC) lastC.y = +v;
+      else if (c === 11) { lastF = { x: +v, y: 0 }; fit.push(lastF); }
+      else if (c === 21 && lastF) lastF.y = +v;
+    }
+    if (ctrl.length < deg + 1 || knots.length !== ctrl.length + deg + 1) return fit.length ? fit : ctrl;
+    const P = ctrl.map((p, i) => { const wi = w.length === ctrl.length ? w[i] : 1; return [p.x * wi, p.y * wi, wi]; });
+    const n = ctrl.length, p = deg, t = knots;
+    const evalAt = (k, u) => {
+      const d = [];
+      for (let j = 0; j <= p; j++) d.push(P[j + k - p].slice());
+      for (let r = 1; r <= p; r++) {
+        for (let j = p; j >= r; j--) {
+          const den = t[j + 1 + k - r] - t[j + k - p];
+          const al = den === 0 ? 0 : (u - t[j + k - p]) / den;
+          for (let q = 0; q < 3; q++) d[j][q] = (1 - al) * d[j - 1][q] + al * d[j][q];
+        }
+      }
+      return { x: d[p][0] / d[p][2], y: d[p][1] / d[p][2] };
+    };
+    const pts = []; const SPS = 16; let lastK = p;
+    for (let k = p; k < n; k++) {
+      if (t[k + 1] - t[k] <= 0) continue;
+      lastK = k;
+      for (let s = 0; s < SPS; s++) pts.push(evalAt(k, t[k] + (t[k + 1] - t[k]) * s / SPS));
+    }
+    pts.push(evalAt(lastK, t[n]));
+    return pts;
+  }
+  function chainOpen(open) {
+    const res = [];
+    const segs = open.map(s => s.slice());
+    let span = 1;
+    for (const s of segs) for (const p of s) span = Math.max(span, Math.abs(p.x), Math.abs(p.y));
+    const tol = span * 1e-5;
+    while (segs.length) {
+      let chain = segs.pop();
+      let grew = true;
+      while (grew && dist(chain[0], chain[chain.length - 1]) > tol) {
+        grew = false;
+        for (let i = 0; i < segs.length; i++) {
+          const s = segs[i], end = chain[chain.length - 1], beg = chain[0];
+          if (dist(end, s[0]) < tol) chain = chain.concat(s.slice(1));
+          else if (dist(end, s[s.length - 1]) < tol) chain = chain.concat(s.slice(0, -1).reverse());
+          else if (dist(beg, s[s.length - 1]) < tol) chain = s.slice(0, -1).concat(chain);
+          else if (dist(beg, s[0]) < tol) chain = s.slice(1).reverse().concat(chain);
+          else continue;
+          segs.splice(i, 1); grew = true; break;
+        }
+      }
+      if (chain.length >= 3) res.push(chain);
+    }
+    return res;
+  }
+
+
+  /* ---------------- SVG ---------------- */
+  function parseSVG(text) {
+    const loops = [];
+    const I = [1, 0, 0, 1, 0, 0];
+    const mul = (m, n) => [m[0] * n[0] + m[2] * n[1], m[1] * n[0] + m[3] * n[1], m[0] * n[2] + m[2] * n[3], m[1] * n[2] + m[3] * n[3], m[0] * n[4] + m[2] * n[5] + m[4], m[1] * n[4] + m[3] * n[5] + m[5]];
+    const ap = (m, x, y) => ({ x: m[0] * x + m[2] * y + m[4], y: m[1] * x + m[3] * y + m[5] });
+    function parseTransform(t) {
+      let m = I.slice(); if (!t) return m;
+      const re = /(matrix|translate|scale|rotate|skewX|skewY)\s*\(([^)]*)\)/g; let r;
+      while ((r = re.exec(t))) {
+        const v = (r[2].match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || []).map(Number);
+        let n = I;
+        switch (r[1]) {
+          case 'matrix': n = v.slice(0, 6); break;
+          case 'translate': n = [1, 0, 0, 1, v[0] || 0, v[1] || 0]; break;
+          case 'scale': n = [v[0], 0, 0, v.length > 1 ? v[1] : v[0], 0, 0]; break;
+          case 'rotate': {
+            const a = (v[0] || 0) * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+            n = [c, s, -s, c, 0, 0];
+            if (v.length > 2) n = mul(mul([1, 0, 0, 1, v[1], v[2]], n), [1, 0, 0, 1, -v[1], -v[2]]);
+            break;
+          }
+          case 'skewX': n = [1, 0, Math.tan(v[0] * Math.PI / 180), 1, 0, 0]; break;
+          case 'skewY': n = [1, Math.tan(v[0] * Math.PI / 180), 0, 1, 0, 0]; break;
+        }
+        m = mul(m, n);
+      }
+      return m;
+    }
+    const attrs = str => { const o = {}; const re = /([\w:-]+)\s*=\s*("([^"]*)"|'([^']*)')/g; let r; while ((r = re.exec(str))) o[r[1]] = r[3] !== undefined ? r[3] : r[4]; return o; };
+    const num = (v, d) => { const f = parseFloat(v); return isNaN(f) ? (d || 0) : f; };
+    const style = a => { const o = {}; (a.style || '').split(';').forEach(kv => { const [k, v] = kv.split(':'); if (k && v) o[k.trim()] = v.trim(); }); return o; };
+    const hidden = a => { const st = style(a); return a.display === 'none' || st.display === 'none' || a.visibility === 'hidden'; };
+    const groups = []; let curRule = 'nonzero';
+    const push = (pts, m) => { if (pts.length >= 3) loops.push(pts.map(p => ap(m, p.x, p.y))); };
+    const startEl = (a) => { const st = style(a); curRule = (a['fill-rule'] || st['fill-rule'] || ruleStack[ruleStack.length - 1] || 'nonzero'); return loops.length; };
+    const endEl = (from) => { if (loops.length > from) groups.push({ from, to: loops.length, rule: curRule }); };
+    const ruleStack = ['nonzero'];
+    const skipTags = new Set(['defs', 'clipPath', 'mask', 'symbol', 'pattern', 'marker', 'metadata', 'title', 'desc', 'style', 'linearGradient', 'radialGradient', 'filter', 'text']);
+    const stack = [I.slice()]; let skip = 0;
+    const tagRe = /<(\/?)([\w:-]+)([^>]*?)(\/?)>|<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<![^>]*>/g;
+    let t;
+    while ((t = tagRe.exec(text))) {
+      if (!t[2]) continue;
+      const close = t[1] === '/', name = t[2].replace(/^.*:/, ''), selfClose = t[4] === '/' || /\/\s*$/.test(t[3]);
+      if (close) { if (skip) { if (skipTags.has(name)) skip--; continue; } if (name === 'g' || name === 'svg' || name === 'a') { stack.pop(); ruleStack.pop(); } continue; }
+      if (skip) { if (skipTags.has(name) && !selfClose) skip++; continue; }
+      if (skipTags.has(name)) { if (!selfClose) skip++; continue; }
+      const a = attrs(t[3]);
+      const m = mul(stack[stack.length - 1], parseTransform(a.transform));
+      if (name === 'g' || name === 'svg' || name === 'a') {
+        let mm = m;
+        if (name === 'svg' && stack.length > 1) mm = mul(m, [1, 0, 0, 1, num(a.x), num(a.y)]);
+        if (hidden(a)) { if (!selfClose) skip++; skipTags.add(name); continue; }
+        if (!selfClose) { stack.push(mm); const st = style(a); ruleStack.push(a['fill-rule'] || st['fill-rule'] || ruleStack[ruleStack.length - 1]); }
+        continue;
+      }
+      if (hidden(a)) continue;
+      const from = startEl(a);
+      switch (name) {
+        case 'path': for (const sp of pathToPolys(a.d || '')) push(sp, m); break;
+        case 'rect': {
+          const x = num(a.x), y = num(a.y), w = num(a.width), h = num(a.height);
+          let rx = num(a.rx, NaN), ry = num(a.ry, NaN); if (isNaN(rx)) rx = isNaN(ry) ? 0 : ry; if (isNaN(ry)) ry = rx;
+          rx = Math.min(rx, w / 2); ry = Math.min(ry, h / 2);
+          if (w <= 0 || h <= 0) break;
+          if (rx > 0) { const p = []; const corner = (cx, cy, a0) => { for (let i = 0; i <= 8; i++) { const an = a0 + Math.PI / 2 * i / 8; p.push({ x: cx + rx * Math.cos(an), y: cy + ry * Math.sin(an) }); } };
+            corner(x + w - rx, y + ry, -Math.PI / 2); corner(x + w - rx, y + h - ry, 0); corner(x + rx, y + h - ry, Math.PI / 2); corner(x + rx, y + ry, Math.PI); push(p, m); }
+          else push([{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }], m);
+          break;
+        }
+        case 'circle': case 'ellipse': {
+          const cx = num(a.cx), cy = num(a.cy), rx = name === 'circle' ? num(a.r) : num(a.rx), ry = name === 'circle' ? num(a.r) : num(a.ry);
+          if (rx <= 0 || ry <= 0) break;
+          const p = []; for (let i = 0; i < 96; i++) { const an = Math.PI * 2 * i / 96; p.push({ x: cx + rx * Math.cos(an), y: cy + ry * Math.sin(an) }); }
+          push(p, m); break;
+        }
+        case 'polygon': case 'polyline': {
+          const v = (a.points || '').match(/[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/g) || [];
+          const p = []; for (let i = 0; i + 1 < v.length; i += 2) p.push({ x: +v[i], y: +v[i + 1] });
+          push(p, m); break;
+        }
+      }
+      endEl(from);
+    }
+    if (!loops.length) throw new Error('Não encontrei formas preenchíveis no SVG (path, rect, circle, ellipse, polygon). Texto tem de ser convertido em contornos.');
+    const out = loops.map(l => dedupe(l.map(p => ({ x: p.x, y: -p.y })))); // SVG tem o Y para baixo
+    out.groups = groups; // cada elemento SVG com a sua regra de preenchimento; elementos somam-se
+    return out;
+  }
+  function pathToPolys(d) {
+    let i = 0; const n = d.length, polys = []; let cur = [];
+    let x = 0, y = 0, sx = 0, sy = 0, cmd = '', lcx = 0, lcy = 0, lqx = 0, lqy = 0, prev = '';
+    const ws = () => { while (i < n && /[\s,]/.test(d[i])) i++; };
+    const isNum = () => { ws(); return i < n && /[-+.\d]/.test(d[i]); };
+    const readNum = () => { ws(); const m = /^[-+]?(?:\d*\.\d+|\d+\.?)(?:[eE][-+]?\d+)?/.exec(d.slice(i, i + 40)); if (!m) throw new Error('SVG: caminho inválido'); i += m[0].length; return +m[0]; };
+    const readFlag = () => { ws(); const c = d[i++]; return c === '1'; };
+    const add = (px, py) => cur.push({ x: px, y: py });
+    const flush = () => { if (cur.length >= 3) polys.push(cur); cur = []; };
+    const cubic = (x1, y1, x2, y2, x3, y3) => { const L = Math.hypot(x1 - x, y1 - y) + Math.hypot(x2 - x1, y2 - y1) + Math.hypot(x3 - x2, y3 - y2); const N = Math.max(4, Math.min(48, Math.ceil(L / 0.6))); for (let k = 1; k <= N; k++) { const t = k / N, u = 1 - t; add(u * u * u * x + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3, u * u * u * y + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3); } };
+    const quad = (x1, y1, x2, y2) => { const L = Math.hypot(x1 - x, y1 - y) + Math.hypot(x2 - x1, y2 - y1); const N = Math.max(4, Math.min(40, Math.ceil(L / 0.6))); for (let k = 1; k <= N; k++) { const t = k / N, u = 1 - t; add(u * u * x + 2 * u * t * x1 + t * t * x2, u * u * y + 2 * u * t * y1 + t * t * y2); } };
+    const arc = (rx, ry, phi, large, sweep, x2, y2) => {
+      if (rx === 0 || ry === 0) { add(x2, y2); return; }
+      rx = Math.abs(rx); ry = Math.abs(ry); const p = phi * Math.PI / 180, cp = Math.cos(p), sp = Math.sin(p);
+      const dx = (x - x2) / 2, dy = (y - y2) / 2, x1p = cp * dx + sp * dy, y1p = -sp * dx + cp * dy;
+      let lam = x1p * x1p / (rx * rx) + y1p * y1p / (ry * ry); if (lam > 1) { rx *= Math.sqrt(lam); ry *= Math.sqrt(lam); }
+      let num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p; num = Math.max(0, num);
+      let co = Math.sqrt(num / (rx * rx * y1p * y1p + ry * ry * x1p * x1p)); if (large === sweep) co = -co;
+      const cxp = co * rx * y1p / ry, cyp = -co * ry * x1p / rx;
+      const cx = cp * cxp - sp * cyp + (x + x2) / 2, cy = sp * cxp + cp * cyp + (y + y2) / 2;
+      const ang = (ux, uy, vx, vy) => { const a = Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy); return a; };
+      const t1 = ang(1, 0, (x1p - cxp) / rx, (y1p - cyp) / ry);
+      let dt = ang((x1p - cxp) / rx, (y1p - cyp) / ry, (-x1p - cxp) / rx, (-y1p - cyp) / ry);
+      if (!sweep && dt > 0) dt -= Math.PI * 2; else if (sweep && dt < 0) dt += Math.PI * 2;
+      const N = Math.max(6, Math.ceil(Math.abs(dt) / (Math.PI * 2) * 64));
+      for (let k = 1; k <= N; k++) { const t = t1 + dt * k / N; add(cx + rx * Math.cos(t) * cp - ry * Math.sin(t) * sp, cy + rx * Math.cos(t) * sp + ry * Math.sin(t) * cp); }
+    };
+    while (i < n) {
+      ws(); if (i >= n) break;
+      if (/[a-zA-Z]/.test(d[i])) cmd = d[i++]; else if (!cmd) { i++; continue; }
+      const rel = cmd === cmd.toLowerCase(), C = cmd.toUpperCase();
+      const ox = rel ? x : 0, oy = rel ? y : 0;
+      switch (C) {
+        case 'M': { flush(); x = readNum() + ox; y = readNum() + oy; sx = x; sy = y; add(x, y); cmd = rel ? 'l' : 'L'; break; }
+        case 'L': x = readNum() + ox; y = readNum() + oy; add(x, y); break;
+        case 'H': x = readNum() + ox; add(x, y); break;
+        case 'V': y = readNum() + oy; add(x, y); break;
+        case 'C': { const x1 = readNum() + ox, y1 = readNum() + oy, x2 = readNum() + ox, y2 = readNum() + oy, x3 = readNum() + ox, y3 = readNum() + oy; cubic(x1, y1, x2, y2, x3, y3); lcx = x2; lcy = y2; x = x3; y = y3; break; }
+        case 'S': { let x1 = x, y1 = y; if (/[CS]/.test(prev)) { x1 = 2 * x - lcx; y1 = 2 * y - lcy; } const x2 = readNum() + ox, y2 = readNum() + oy, x3 = readNum() + ox, y3 = readNum() + oy; cubic(x1, y1, x2, y2, x3, y3); lcx = x2; lcy = y2; x = x3; y = y3; break; }
+        case 'Q': { const x1 = readNum() + ox, y1 = readNum() + oy, x2 = readNum() + ox, y2 = readNum() + oy; quad(x1, y1, x2, y2); lqx = x1; lqy = y1; x = x2; y = y2; break; }
+        case 'T': { let x1 = x, y1 = y; if (/[QT]/.test(prev)) { x1 = 2 * x - lqx; y1 = 2 * y - lqy; } const x2 = readNum() + ox, y2 = readNum() + oy; quad(x1, y1, x2, y2); lqx = x1; lqy = y1; x = x2; y = y2; break; }
+        case 'A': { const rx = readNum(), ry = readNum(), ph = readNum(), la = readFlag(), sw = readFlag(); const x2 = readNum() + ox, y2 = readNum() + oy; arc(rx, ry, ph, la, sw, x2, y2); x = x2; y = y2; break; }
+        case 'Z': flush(); x = sx; y = sy; break;
+        default: i++;
+      }
+      prev = C;
+      if (C === 'Z') { cmd = ''; continue; }
+      if (!isNum()) { /* espera próximo comando */ }
+    }
+    flush();
+    return polys.map(dedupe);
+  }
+  // escolhe o leitor pela extensão ou pelo conteúdo
+  function parseArt(text, name) {
+    if (/\.svg$/i.test(name || '') || /<svg[\s>]/i.test(text.slice(0, 4000))) return parseSVG(text);
+    return parseDXF(text);
+  }
+
+  /* ---------------- STL (medalha) ---------------- */
+  function parseSTLTriangles(buf) {
+    const dv = new DataView(buf);
+    let tris = null;
+    if (buf.byteLength >= 84) {
+      const n = dv.getUint32(80, true);
+      if (84 + n * 50 === buf.byteLength) {
+        tris = new Float32Array(n * 9);
+        for (let i = 0; i < n; i++) for (let j = 0; j < 9; j++) tris[i * 9 + j] = dv.getFloat32(84 + i * 50 + 12 + j * 4, true);
+      }
+    }
+    if (!tris) {
+      const txt = new TextDecoder().decode(new Uint8Array(buf));
+      const re = /vertex\s+([-+\deE.]+)\s+([-+\deE.]+)\s+([-+\deE.]+)/g; const v = []; let m;
+      while ((m = re.exec(txt))) v.push(+m[1], +m[2], +m[3]);
+      if (!v.length) throw new Error('STL inválido');
+      tris = new Float32Array(v);
+    }
+    return tris;
+  }
+  function medalFromSTL(buf) {
+    const tris = parseSTLTriangles(buf);
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < tris.length; i += 3) for (let a = 0; a < 3; a++) { mn[a] = Math.min(mn[a], tris[i + a]); mx[a] = Math.max(mx[a], tris[i + a]); }
+    const ext = [0, 1, 2].map(a => mx[a] - mn[a]);
+    const k = ext.indexOf(Math.min(...ext));
+    const [ui, vi] = k === 2 ? [0, 1] : k === 1 ? [0, 2] : [1, 2];
+    const eps = Math.max(1e-4, ext[k] * 1e-3);
+    const q = x => Math.round(x * 1e4);
+    const E = new Map(), P = new Map();
+    for (let i = 0; i < tris.length; i += 9) {
+      let flat = true;
+      for (let j = 0; j < 3; j++) if (Math.abs(tris[i + j * 3 + k] - mn[k]) > eps) flat = false;
+      if (!flat) continue;
+      const keys = [];
+      for (let j = 0; j < 3; j++) {
+        const u = tris[i + j * 3 + ui], v = tris[i + j * 3 + vi];
+        const key = q(u) + ',' + q(v); P.set(key, { x: u, y: v }); keys.push(key);
+      }
+      for (let j = 0; j < 3; j++) {
+        const a = keys[j], b = keys[(j + 1) % 3]; if (a === b) continue;
+        const ek = a < b ? a + '|' + b : b + '|' + a;
+        E.set(ek, (E.get(ek) || 0) + 1);
+      }
+    }
+    const adj = new Map();
+    for (const [ek, c] of E) if (c === 1) {
+      const [a, b] = ek.split('|');
+      if (!adj.has(a)) adj.set(a, []); if (!adj.has(b)) adj.set(b, []);
+      adj.get(a).push(b); adj.get(b).push(a);
+    }
+    if (!adj.size) throw new Error('Não consegui extrair o contorno da medalha (a face de trás tem de ser plana).');
+    const seen = new Set(), loops = [];
+    for (const s of adj.keys()) {
+      if (seen.has(s)) continue;
+      const loop = [s]; seen.add(s); let cur = s;
+      for (;;) { const nx = adj.get(cur).find(x => !seen.has(x)); if (!nx) break; seen.add(nx); loop.push(nx); cur = nx; }
+      if (loop.length >= 3) loops.push(loop.map(key => P.get(key)));
+    }
+    // normalizar: região por par/ímpar, centrada na caixa
+    let paths = loops.map(l => l.map(p => ({ X: Math.round(p.x * S), Y: Math.round(p.y * S) })));
+    paths = union(paths, ClipperLib.PolyFillType.pftEvenOdd);
+    const b = ClipperLib.JS.BoundsOfPaths(paths);
+    const cx = Math.round((b.left + b.right) / 2), cy = Math.round((b.top + b.bottom) / 2);
+    paths = paths.map(p => p.map(pt => ({ X: pt.X - cx, Y: pt.Y - cy })));
+    return { paths, thickness: ext[k], width: (b.right - b.left) / S, height: (b.bottom - b.top) / S, axis: 'XYZ'[k] };
+  }
+
+  /* ---------------- Clipper helpers ---------------- */
+  function clip(subj, clipP, type, fill) {
+    const c = new ClipperLib.Clipper();
+    c.PreserveCollinear = true;
+    c.AddPaths(subj, ClipperLib.PolyType.ptSubject, true);
+    if (clipP) c.AddPaths(clipP, ClipperLib.PolyType.ptClip, true);
+    const sol = [];
+    const f = fill === undefined ? ClipperLib.PolyFillType.pftNonZero : fill;
+    c.Execute(type, sol, f, f);
+    return sol;
+  }
+  const union = (p, fill) => clip(p, null, ClipperLib.ClipType.ctUnion, fill);
+  const inter = (a, b) => clip(a, b, ClipperLib.ClipType.ctIntersection);
+  const diff = (a, b) => clip(a, b, ClipperLib.ClipType.ctDifference);
+  function offset(paths, mm) {
+    if (Math.abs(mm) < 1e-6) return paths.map(p => p.slice());
+    const co = new ClipperLib.ClipperOffset(2, ARC_TOL);
+    co.AddPaths(paths, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+    const sol = []; co.Execute(sol, mm * S); return sol;
+  }
+  const areaMM2 = paths => paths.reduce((s, p) => s + ClipperLib.Clipper.Area(p), 0) / (S * S);
+  function dropTiny(paths, minArea) {
+    return paths.filter(p => Math.abs(ClipperLib.Clipper.Area(p)) / (S * S) >= minArea);
+  }
+
+  /* ---------------- Arte ---------------- */
+  function artBounds(loops) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const l of loops) for (const p of l) { x0 = Math.min(x0, p.x); y0 = Math.min(y0, p.y); x1 = Math.max(x1, p.x); y1 = Math.max(y1, p.y); }
+    return { x0, y0, x1, y1, w: x1 - x0, h: y1 - y0, cx: (x0 + x1) / 2, cy: (y0 + y1) / 2 };
+  }
+  function transformArt(loops, P) {
+    const b = artBounds(loops);
+    const s = P.artWidth / b.w;
+    const a = P.rotation * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    return loops.map(l => l.map(p => {
+      let x = (p.x - b.cx) * s, y = (p.y - b.cy) * s;
+      if (P.mirrorArt) x = -x;
+      return { X: Math.round((x * ca - y * sa + P.offX) * S), Y: Math.round((x * sa + y * ca + P.offY) * S) };
+    }));
+  }
+
+  /* ---------------- Molduras circulares ---------------- */
+  const FRAME_TYPES = {
+    none: { label: 'Sem moldura' },
+    fina: { label: 'Linha fina', size: 0.6 },
+    grossa: { label: 'Linha grossa', size: 1.6 },
+    dupla: { label: 'Linha dupla (grossa + fina)', size: 1.4 },
+    tracejada: { label: 'Linha tracejada', size: 0.9 },
+    pontos: { label: 'Pontos', size: 1.2 },
+    contas: { label: 'Contas (pontos encostados)', size: 1.0 },
+    estrelas: { label: 'Estrelas', size: 2.4 },
+    serrilha: { label: 'Serrilha (dentes)', size: 1.3 },
+    corda: { label: 'Corda', size: 1.6 },
+    louros: { label: 'Louros', size: 5 },
+    louros_pontos: { label: 'Louros + pontos', size: 5 }
+  };
+  const TAU = Math.PI * 2;
+  const toInt = pts => pts.map(p => ({ X: Math.round(p[0] * S), Y: Math.round(p[1] * S) }));
+  function circlePts(cx, cy, r, n) {
+    n = n || Math.max(16, Math.min(360, Math.ceil(TAU * r / 0.15)));
+    const o = []; for (let i = 0; i < n; i++) { const a = TAU * i / n; o.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); }
+    return toInt(o);
+  }
+  function ringPaths(rOut, w) { return diff([circlePts(0, 0, rOut)], [circlePts(0, 0, rOut - w)]); }
+  function arcBand(r0, r1, a0, a1) {
+    const n = Math.max(8, Math.ceil(Math.abs(a1 - a0) * r1 / 0.15)), o = [];
+    for (let i = 0; i <= n; i++) { const a = a0 + (a1 - a0) * i / n; o.push([r1 * Math.cos(a), r1 * Math.sin(a)]); }
+    for (let i = n; i >= 0; i--) { const a = a0 + (a1 - a0) * i / n; o.push([r0 * Math.cos(a), r0 * Math.sin(a)]); }
+    return toInt(o);
+  }
+  function starPts(cx, cy, rOut, rot) {
+    const o = [], rIn = rOut * 0.42;
+    for (let i = 0; i < 10; i++) { const a = rot + Math.PI * i / 5, r = i % 2 ? rIn : rOut; o.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); }
+    return toInt(o);
+  }
+  function leafPts(px, py, dx, dy, L, W) {
+    const nx = -dy, ny = dx, left = [], right = [], N = 14;
+    for (let i = 0; i <= N; i++) {
+      const u = i / N, hw = W / 2 * Math.pow(Math.sin(Math.PI * Math.min(1, u * 1.08)), 0.85);
+      const bx = px + dx * L * u, by = py + dy * L * u;
+      left.push([bx + nx * hw, by + ny * hw]); right.push([bx - nx * hw, by - ny * hw]);
+    }
+    return toInt(left.concat(right.reverse()));
+  }
+  function rotatePaths(paths, deg) {
+    const a = deg * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a);
+    return paths.map(p => p.map(q => ({ X: Math.round(q.X * c - q.Y * sn), Y: Math.round(q.X * sn + q.Y * c) })));
+  }
+  // medalha rodada no plano (em torno do centro); devolve uma cópia
+  function rotateMedal(medal, deg) {
+    if (!deg) return medal;
+    const paths = rotatePaths(medal.paths, deg);
+    const b = ClipperLib.JS.BoundsOfPaths(paths);
+    return Object.assign({}, medal, { paths, width: (b.right - b.left) / S, height: (b.bottom - b.top) / S });
+  }
+  // raio do maior círculo centrado que cabe na área útil da medalha
+  function safeRadius(medal, margin) {
+    const safe = offset(medal.paths, -margin);
+    let best = Infinity;
+    for (const p of safe) for (let i = 0; i < p.length; i++) {
+      const a = p[i], b = p[(i + 1) % p.length];
+      const ax = a.X / S, ay = a.Y / S, bx = b.X / S, by = b.Y / S, vx = bx - ax, vy = by - ay;
+      const t = Math.max(0, Math.min(1, -(ax * vx + ay * vy) / (vx * vx + vy * vy || 1)));
+      best = Math.min(best, Math.hypot(ax + vx * t, ay + vy * t));
+    }
+    return isFinite(best) ? best : 0;
+  }
+  // devolve { paths, innerR } no referencial da medalha (centro da medalha)
+  function buildFrame(medal, P) {
+    const type = P.frameType || 'none';
+    if (type === 'none' || !FRAME_TYPES[type]) return null;
+    const R = P.frameR > 0 ? P.frameR : safeRadius(medal, P.margin);
+    const sz = P.frameSize > 0 ? P.frameSize : FRAME_TYPES[type].size;
+    let out = [], r = R;
+    const line = 0.5, lgap = 0.6;
+    if (P.frameLines && !['fina', 'grossa', 'dupla'].includes(type)) { out = out.concat(ringPaths(R, line)); r = R - line - lgap; }
+    const count = (natural) => P.frameCount > 0 ? Math.round(P.frameCount) : Math.max(3, Math.floor(natural));
+    let inner;
+    switch (type) {
+      case 'fina': case 'grossa': out = out.concat(ringPaths(r, sz)); inner = r - sz; break;
+      case 'dupla': out = out.concat(ringPaths(r, sz), ringPaths(r - sz - 0.8, 0.5)); inner = r - sz - 1.3; break;
+      case 'tracejada': {
+        const n = count(TAU * (r - sz / 2) / (sz * 3.2));
+        for (let i = 0; i < n; i++) { const a = TAU * i / n; out.push(arcBand(r - sz, r, a, a + TAU / n * 0.55)); }
+        inner = r - sz; break;
+      }
+      case 'pontos': case 'contas': {
+        const rc = r - sz / 2, n = count(TAU * rc / (sz * (type === 'contas' ? 1.25 : 1.9)));
+        for (let i = 0; i < n; i++) { const a = TAU * i / n + Math.PI / 2; out.push(circlePts(rc * Math.cos(a), rc * Math.sin(a), sz / 2, 32)); }
+        inner = r - sz; break;
+      }
+      case 'estrelas': {
+        const rc = r - sz / 2, n = count(TAU * rc / (sz * 1.45));
+        for (let i = 0; i < n; i++) { const a = TAU * i / n + Math.PI / 2; out.push(starPts(rc * Math.cos(a), rc * Math.sin(a), sz / 2, a)); }
+        inner = r - sz; break;
+      }
+      case 'serrilha': {
+        out = out.concat(ringPaths(r, 0.5));
+        const rb = r - 0.4, n = count(TAU * rb / (sz * 0.95));
+        for (let i = 0; i < n; i++) {
+          const a0 = TAU * i / n, a1 = TAU * (i + 1) / n, am = (a0 + a1) / 2;
+          out.push(toInt([[rb * Math.cos(a0), rb * Math.sin(a0)], [(rb - sz) * Math.cos(am), (rb - sz) * Math.sin(am)], [rb * Math.cos(a1), rb * Math.sin(a1)], [(rb + 0.3) * Math.cos(am), (rb + 0.3) * Math.sin(am)]]));
+        }
+        inner = rb - sz; break;
+      }
+      case 'corda': {
+        const r0 = r - sz, n = count(TAU * r / (sz * 0.75)), per = TAU / n, sh = sz * 0.9 / r;
+        for (let i = 0; i < n; i++) {
+          const a = per * i, d = per * 0.62;
+          const q = [[r0, a], [r0, a + d], [r, a + d + sh], [r, a + sh]];
+          out.push(toInt(q.map(([rr, aa]) => [rr * Math.cos(aa), rr * Math.sin(aa)])));
+        }
+        inner = r0; break;
+      }
+      case 'louros': case 'louros_pontos': {
+        const w = sz, rc = r - w / 2, stemW = Math.max(0.5, w * 0.1);
+        const aB = -Math.PI / 2 + 0.16, aT = Math.PI / 2 - 0.42;
+        const L = w * 0.5, W = Math.max(0.9, w * 0.2), tilt = 0.75;
+        const per = P.frameCount > 0 ? (aT - aB) / P.frameCount : (L * 0.62) / rc;
+        const n = Math.max(3, Math.floor((aT - aB) / per));
+        for (const side of [1, -1]) {
+          const parts = [arcBand(rc - stemW / 2, rc + stemW / 2, aB, aT)];
+          for (let k = 0; k < n; k++) {
+            const f = 1 - 0.35 * k / n;
+            for (const [off, s] of [[0, 1], [0.5, -1]]) {
+              const a = aB + per * (k + off + 0.3);
+              if (a > aT - per * 0.2) continue;
+              const px = rc * Math.cos(a), py = rc * Math.sin(a);
+              const tx = -Math.sin(a), ty = Math.cos(a), nx = Math.cos(a), ny = Math.sin(a);
+              let dx = tx * Math.cos(tilt) + s * nx * Math.sin(tilt), dy = ty * Math.cos(tilt) + s * ny * Math.sin(tilt);
+              parts.push(leafPts(px, py, dx, dy, L * f, W * f));
+            }
+          }
+          // folha da ponta
+          const px = rc * Math.cos(aT), py = rc * Math.sin(aT);
+          parts.push(leafPts(px, py, -Math.sin(aT), Math.cos(aT), L * 0.6, W * 0.6));
+          let branch = union(parts);
+          if (side < 0) branch = branch.map(p => p.map(pt => ({ X: -pt.X, Y: pt.Y })).reverse());
+          out = out.concat(branch);
+        }
+        if (type === 'louros_pontos') {
+          const dR = 0.55, n2 = 3;
+          for (let i = 0; i < n2; i++) { const a = Math.PI / 2 + (i - 1) * 0.11; out.push(circlePts(rc * Math.cos(a), rc * Math.sin(a), dR, 24)); }
+        }
+        inner = r - w; break;
+      }
+    }
+    let paths = union(out);
+    if (P.frameRot) paths = rotatePaths(paths, P.frameRot);
+    return { paths, innerR: inner, R };
+  }
+
+  // região 2D em relevo (no referencial do positivo)
+  // une a arte: DXF → regra global escolhida; SVG → regra de cada elemento e depois soma dos elementos
+  function artUnion(loops, P) {
+    const EO = ClipperLib.PolyFillType.pftEvenOdd, NZ = ClipperLib.PolyFillType.pftNonZero;
+    const paths = transformArt(loops, P);
+    if (loops.groups && loops.groups.length && P.fillRule !== 'evenodd_all') {
+      let res = [];
+      for (const g of loops.groups) res = res.concat(union(paths.slice(g.from, g.to).filter(p => p.length >= 3), g.rule === 'evenodd' ? EO : NZ));
+      return union(res, NZ);
+    }
+    return union(paths, P.fillRule === 'nonzero' ? NZ : EO);
+  }
+  // área disponível para a arte (dentro da margem e, havendo moldura, dentro dela)
+  function artArea(medal, P, frame) {
+    let safe = offset(medal.paths, -P.margin);
+    if (frame) safe = inter(safe, [circlePts(0, 0, Math.max(0.5, frame.innerR - (P.frameGap || 0)))]);
+    return safe;
+  }
+  function buildArtRegion(medal, loops, P) {
+    let art = loops && loops.length ? artUnion(loops, P) : [];
+    if (P.stroke && art.length) art = offset(art, P.stroke);
+    const safe = offset(medal.paths, -P.margin);
+    const frame = buildFrame(medal, P);
+    if (P.invert) art = diff(artArea(medal, P, frame), art);
+    else if (frame && P.frameClip) art = inter(art, artArea(medal, P, frame));
+    if (frame) art = union(art.concat(frame.paths));
+    if (P.ring > 0) {
+      const ring = diff(safe, offset(medal.paths, -(P.margin + P.ring)));
+      art = union(art.concat(ring));
+    }
+    art = inter(art, safe);
+    art = dropTiny(art, 0.01);
+    return ClipperLib.Clipper.CleanPolygons(art, 0.002 * S);
+  }
+  function pointInPaths(x, y, paths) {
+    let inside = false;
+    for (const p of paths) for (let i = 0, j = p.length - 1; i < p.length; j = i++) {
+      const xi = p[i].X, yi = p[i].Y, xj = p[j].X, yj = p[j].Y;
+      if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+  // maior largura da arte que cabe na área útil (testa os vértices da arte, escalados em torno da posição)
+  function fitWidth(medal, loops, P) {
+    const safe = artArea(medal, P, buildFrame(medal, P));
+    const base = transformArt(loops, Object.assign({}, P, { artWidth: 10 }));
+    let pts = [];
+    for (const l of base) for (const p of l) pts.push(p);
+    const stride = Math.max(1, Math.floor(pts.length / 2500)); if (stride > 1) pts = pts.filter((_, i) => i % stride === 0);
+    const ox = P.offX * S, oy = P.offY * S;
+    const fits = w => { const k = w / 10; for (const p of pts) if (!pointInPaths(ox + (p.X - ox) * k, oy + (p.Y - oy) * k, safe)) return false; return true; };
+    let lo = 0.1, hi = Math.max(medal.width, medal.height) * 2;
+    for (let i = 0; i < 20; i++) { const mid = (lo + hi) / 2; if (fits(mid)) lo = mid; else hi = mid; }
+    return lo;
+  }
+
+
+  /* ---------------- Malha ---------------- */
+  function signedArea(path) { return ClipperLib.Clipper.Area(path); }
+  function polyTree(paths) {
+    const c = new ClipperLib.Clipper();
+    c.PreserveCollinear = true;
+    c.AddPaths(paths, ClipperLib.PolyType.ptSubject, true);
+    const t = new ClipperLib.PolyTree();
+    c.Execute(ClipperLib.ClipType.ctUnion, t, ClipperLib.PolyFillType.pftNonZero, ClipperLib.PolyFillType.pftNonZero);
+    const groups = [];
+    const walk = node => {
+      for (const ch of node.Childs()) {
+        if (!ch.IsHole()) {
+          groups.push({ outer: ch.Contour(), holes: ch.Childs().map(h => h.Contour()) });
+          for (const h of ch.Childs()) walk(h);
+        }
+      }
+    };
+    walk(t);
+    return groups;
+  }
+  function extrude(paths, z0, z1, out) {
+    if (z1 - z0 < 1e-6 || !paths.length) return;
+    for (const g of polyTree(paths)) {
+      let outer = g.outer.slice(); if (signedArea(outer) < 0) outer.reverse();
+      const holes = g.holes.map(h => { const hh = h.slice(); if (signedArea(hh) > 0) hh.reverse(); return hh; });
+      const flat = [], holeIdx = [];
+      for (const p of outer) flat.push(p.X / S, p.Y / S);
+      for (const h of holes) { holeIdx.push(flat.length / 2); for (const p of h) flat.push(p.X / S, p.Y / S); }
+      const idx = earcut(flat, holeIdx.length ? holeIdx : null, 2);
+      for (let i = 0; i < idx.length; i += 3) {
+        let a = idx[i], b = idx[i + 1], c = idx[i + 2];
+        const ar = (flat[2 * b] - flat[2 * a]) * (flat[2 * c + 1] - flat[2 * a + 1]) - (flat[2 * c] - flat[2 * a]) * (flat[2 * b + 1] - flat[2 * a + 1]);
+        if (ar < 0) { const t = b; b = c; c = t; }
+        out.push(flat[2 * a], flat[2 * a + 1], z1, flat[2 * b], flat[2 * b + 1], z1, flat[2 * c], flat[2 * c + 1], z1);
+        out.push(flat[2 * a], flat[2 * a + 1], z0, flat[2 * c], flat[2 * c + 1], z0, flat[2 * b], flat[2 * b + 1], z0);
+      }
+      for (const ring of [outer].concat(holes)) {
+        for (let i = 0; i < ring.length; i++) {
+          const p = ring[i], q = ring[(i + 1) % ring.length];
+          const ax = p.X / S, ay = p.Y / S, bx = q.X / S, by = q.Y / S;
+          out.push(ax, ay, z0, bx, by, z0, bx, by, z1);
+          out.push(ax, ay, z0, bx, by, z1, ax, ay, z1);
+        }
+      }
+    }
+  }
+  function groups(paths) {
+    return polyTree(paths).map(g => {
+      const outer = g.outer.slice(); if (signedArea(outer) < 0) outer.reverse();
+      const holes = g.holes.map(h => { const hh = h.slice(); if (signedArea(hh) > 0) hh.reverse(); return hh; });
+      return { outer, holes };
+    });
+  }
+  // tampa horizontal; up=true normal +z
+  function cap(paths, z, up, out) {
+    for (const g of groups(paths)) {
+      const flat = [], holeIdx = [];
+      for (const p of g.outer) flat.push(p.X / S, p.Y / S);
+      for (const h of g.holes) { holeIdx.push(flat.length / 2); for (const p of h) flat.push(p.X / S, p.Y / S); }
+      const idx = earcut(flat, holeIdx.length ? holeIdx : null, 2);
+      for (let i = 0; i < idx.length; i += 3) {
+        let a = idx[i], b = idx[i + 1], c = idx[i + 2];
+        const ar = (flat[2 * b] - flat[2 * a]) * (flat[2 * c + 1] - flat[2 * a + 1]) - (flat[2 * c] - flat[2 * a]) * (flat[2 * b + 1] - flat[2 * a + 1]);
+        if ((ar < 0) === up) { const t = b; b = c; c = t; }
+        out.push(flat[2 * a], flat[2 * a + 1], z, flat[2 * b], flat[2 * b + 1], z, flat[2 * c], flat[2 * c + 1], z);
+      }
+    }
+  }
+  // paredes verticais; inward=true quando o sólido está fora da região (cavidade)
+  function walls(paths, z0, z1, inward, out) {
+    if (z1 - z0 < 1e-9) return;
+    for (const g of groups(paths)) for (const ring of [g.outer].concat(g.holes)) {
+      for (let i = 0; i < ring.length; i++) {
+        let p = ring[i], q = ring[(i + 1) % ring.length];
+        if (inward) { const t = p; p = q; q = t; }
+        const ax = p.X / S, ay = p.Y / S, bx = q.X / S, by = q.Y / S;
+        out.push(ax, ay, z0, bx, by, z0, bx, by, z1);
+        out.push(ax, ay, z0, bx, by, z1, ax, ay, z1);
+      }
+    }
+  }
+  // normaliza e garante que cada camada fica estritamente dentro da anterior
+  // camada = arte deslocada d mm, com abertura morfológica mínima (separa formas que só se tocam
+  // num ponto → evita arestas não-manifold). Camadas do mesmo desenho ficam naturalmente encaixadas.
+  function layerAt(art, d, clipTo) {
+    let L = offset(offset(art, d - 0.02), 0.017);
+    if (clipTo) L = inter(L, clipTo);
+    return ClipperLib.Clipper.CleanPolygons(dropTiny(L, 0.005), 0.004 * S);
+  }
+  function nestLayers(layers) {
+    const out = [];
+    for (let i = 0; i < layers.length; i++) {
+      // abertura morfológica mínima: separa formas que só se tocam num ponto (evita arestas não-manifold)
+      let L = offset(offset(union(layers[i]), -0.02), 0.017);
+      if (i > 0) L = inter(L, offset(out[i - 1], -0.004));
+      L = ClipperLib.Clipper.CleanPolygons(union(dropTiny(L, 0.005)), 0.004 * S);
+      out.push(L);
+    }
+    return out;
+  }
+
+  // fecha pequenos buracos (lascas descartadas pela triangulação)
+  function closeSmallHoles(tris) {
+    // chaves numéricas (µm) em vez de strings: muito mais rápido e sem lixo para o GC
+    const vid = new Map(), pos = [];
+    const id = (x, y, z) => {
+      const k = ((Math.round(x * 1e3) + 262144) * 524288 + (Math.round(y * 1e3) + 262144)) * 32768 + (Math.round(z * 1e3) + 16384);
+      let v = vid.get(k); if (v === undefined) { v = pos.length / 3; vid.set(k, v); pos.push(x, y, z); } return v;
+    };
+    const E = 4194304; // 2^22 vértices
+    const dir = new Map();
+    for (let i = 0; i < tris.length; i += 9) {
+      const a = id(tris[i], tris[i + 1], tris[i + 2]), b = id(tris[i + 3], tris[i + 4], tris[i + 5]), c = id(tris[i + 6], tris[i + 7], tris[i + 8]);
+      dir.set(a * E + b, (dir.get(a * E + b) || 0) + 1); dir.set(b * E + c, (dir.get(b * E + c) || 0) + 1); dir.set(c * E + a, (dir.get(c * E + a) || 0) + 1);
+    }
+    const next = new Map();
+    for (const e of dir.keys()) { const a = Math.floor(e / E), b = e - a * E; if (!dir.has(b * E + a)) next.set(a, b); }
+    if (!next.size) return 0;
+    const used = new Set(); let fixed = 0;
+    for (const s0 of next.keys()) {
+      if (used.has(s0)) continue;
+      const loop = [s0]; used.add(s0); let cur = next.get(s0);
+      while (cur !== undefined && cur !== s0 && !used.has(cur) && loop.length < 64) { loop.push(cur); used.add(cur); cur = next.get(cur); }
+      if (cur !== s0 || loop.length < 3) continue;
+      const r = loop.slice().reverse();
+      for (let i = 1; i + 1 < r.length; i++) for (const v of [r[0], r[i], r[i + 1]]) tris.push(pos[3 * v], pos[3 * v + 1], pos[3 * v + 2]);
+      fixed++;
+    }
+    return fixed;
+  }
+
+  function transformTris(arr, dx, mirror) {
+    const out = new Float32Array(arr.length);
+    for (let i = 0; i < arr.length; i += 9) {
+      if (mirror) {
+        out[i] = -arr[i] + dx; out[i + 1] = arr[i + 1]; out[i + 2] = arr[i + 2];
+        out[i + 3] = -arr[i + 6] + dx; out[i + 4] = arr[i + 7]; out[i + 5] = arr[i + 8];
+        out[i + 6] = -arr[i + 3] + dx; out[i + 7] = arr[i + 4]; out[i + 8] = arr[i + 5];
+      } else {
+        for (let j = 0; j < 9; j += 3) { out[i + j] = arr[i + j] + dx; out[i + j + 1] = arr[i + j + 1]; out[i + j + 2] = arr[i + j + 2]; }
+      }
+    }
+    return out;
+  }
+
+
+  /* ---------------- Construção das duas peças ---------------- */
+  function build(medal, loops, P, opts) {
+    const preview = !!(opts && opts.preview);
+    const T = P.baseT > 0 ? P.baseT : medal.thickness;
+    const h = P.reliefH, n = Math.max(1, Math.round(P.steps));
+    const tanA = Math.tan(P.draftDeg * Math.PI / 180);
+    const c = P.paper + P.clearance;
+    const art = union(buildArtRegion(medal, loops, P));
+    const warnings = [];
+    const baseArea = areaMM2(art);
+    if (baseArea < 0.5) warnings.push('A arte ficou praticamente vazia — verifica tamanho, posição e margem.');
+
+    // nº de degraus efetivo (sem ângulo de saída → 1 degrau)
+    const stepOff = tanA * h / n;
+    let nn = stepOff < 0.004 ? 1 : n;
+    if (preview) nn = Math.min(nn, 2);
+    const medalP = union(medal.paths);
+
+    // Positivo (macho): sólido único — base + relevo em degraus com ângulo de saída
+    const male = [];
+    let maleLayers = [];
+    for (let i = 0; i < nn; i++) maleLayers.push(layerAt(art, -tanA * h * i / nn, null));
+    maleLayers = maleLayers.filter(L => L.length);
+    cap(medalP, 0, false, male);
+    walls(medalP, 0, T, false, male);
+    cap(diff(medalP, maleLayers[0] || []), T, true, male);
+    for (let i = 0; i < maleLayers.length; i++) {
+      const z0 = T + h * i / nn, z1 = T + h * (i + 1) / nn;
+      walls(maleLayers[i], z0, z1, false, male);
+      const next = maleLayers[i + 1];
+      cap(next ? diff(maleLayers[i], next) : maleLayers[i], z1, true, male);
+    }
+    const topArea = maleLayers.length ? areaMM2(maleLayers[maleLayers.length - 1]) : 0;
+    if (baseArea > 0 && topArea / baseArea < 0.4) warnings.push('Com este ângulo de saída o topo do relevo perde ' + Math.round(100 - 100 * topArea / baseArea) + '% da área — baixa o ângulo ou aumenta a arte.');
+
+    // Negativo (fêmea): sólido único com cavidade alargada pela folga (depois espelhado)
+    const D = h + P.extraDepth;
+    if (D >= T - 0.4) warnings.push('A cavidade fica quase a atravessar a base — aumenta a espessura.');
+    const rimSafe = offset(medal.paths, -P.rim);
+    let pockets = [];
+    for (let j = 0; j < nn; j++) pockets.push(layerAt(art, c - tanA * h * j / nn, offset(medal.paths, -(P.rim + 0.006 * j))));
+    pockets = pockets.filter(L => L.length);
+    // detalhes que fecham no negativo: espaços interiores da arte que a folga (papel + folga) faz desaparecer
+    // para cada buraco da arte, vê quanto dele sobra fora da cavidade alargada
+    const artHoles = groups(art).flatMap(g => g.holes).filter(h => Math.abs(ClipperLib.Clipper.Area(h)) / (S * S) > 0.05);
+    const hArt = artHoles.length;
+    let closed = 0;
+    for (const h of artHoles) {
+      const hp = h.slice().reverse(), a0 = Math.abs(ClipperLib.Clipper.Area(hp)) / (S * S);
+      const left = pockets.length ? areaMM2(diff([hp], pockets[0])) : a0;
+      if (left < Math.max(0.02, a0 * 0.05)) closed++;
+    }
+    if (closed > 0) warnings.push(`Com papel de ${P.paper.toFixed(2)} mm + folga ${P.clearance.toFixed(2)} mm, ${closed} de ${hArt} espaços interiores da arte fecham-se no negativo (ficam lisos no papel). Aumenta a arte, engrossa o traço ou usa papel mais fino.`);
+    const female = [];
+    cap(medalP, 0, false, female);
+    walls(medalP, 0, T, false, female);
+    cap(diff(medalP, pockets[0] || []), T, true, female);
+    for (let j = 0; j < pockets.length; j++) {
+      const d0 = h * j / nn, d1 = j === pockets.length - 1 ? D : h * (j + 1) / nn;
+      walls(pockets[j], T - d1, T - d0, true, female);
+      const next = pockets[j + 1];
+      cap(next ? diff(pockets[j], next) : pockets[j], T - d1, true, female);
+    }
+
+    if (!preview) { closeSmallHoles(male); closeSmallHoles(female); }
+    const W = medal.width, gap = P.gap;
+    const maleT = transformTris(male, -(W / 2 + gap / 2), false);
+    const femaleT = transformTris(female, (W / 2 + gap / 2), true);
+    return {
+      art, maleLayers, pockets, male: maleT, female: femaleT,
+      maleLocal: transformTris(male, 0, false), femaleLocal: transformTris(female, 0, true),
+      stats: { T, h, D, c, baseArea, topArea, holesArt: hArt, holesClosed: closed, triangles: (maleT.length + femaleT.length) / 9 },
+      warnings
+    };
+  }
+
+  /* ---------------- STL / ZIP ---------------- */
+  function toSTL(arrays, name) {
+    let n = 0; for (const a of arrays) n += a.length / 9;
+    const buf = new ArrayBuffer(84 + n * 50), dv = new DataView(buf);
+    const hdr = (name || 'Embosser').slice(0, 79);
+    for (let i = 0; i < hdr.length; i++) dv.setUint8(i, hdr.charCodeAt(i) & 0x7f);
+    dv.setUint32(80, n, true);
+    let o = 84;
+    for (const a of arrays) for (let i = 0; i < a.length; i += 9) {
+      const ux = a[i + 3] - a[i], uy = a[i + 4] - a[i + 1], uz = a[i + 5] - a[i + 2];
+      const vx = a[i + 6] - a[i], vy = a[i + 7] - a[i + 1], vz = a[i + 8] - a[i + 2];
+      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const l = Math.hypot(nx, ny, nz) || 1;
+      dv.setFloat32(o, nx / l, true); dv.setFloat32(o + 4, ny / l, true); dv.setFloat32(o + 8, nz / l, true);
+      for (let j = 0; j < 9; j++) dv.setFloat32(o + 12 + j * 4, a[i + j], true);
+      dv.setUint16(o + 48, 0, true); o += 50;
+    }
+    return new Uint8Array(buf);
+  }
+  const CRC = (() => { const t = new Uint32Array(256); for (let i = 0; i < 256; i++) { let c = i; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; t[i] = c >>> 0; } return t; })();
+  function crc32(u8) { let c = 0xffffffff; for (let i = 0; i < u8.length; i++) c = CRC[(c ^ u8[i]) & 0xff] ^ (c >>> 8); return (c ^ 0xffffffff) >>> 0; }
+  function zip(files) { // [{name, data:Uint8Array}] — sem compressão
+    const enc = s => new TextEncoder().encode(s);
+    const parts = [], central = []; let off = 0;
+    for (const f of files) {
+      const nm = enc(f.name), crc = crc32(f.data), sz = f.data.length;
+      const lh = new DataView(new ArrayBuffer(30));
+      lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(8, 0, true);
+      lh.setUint32(14, crc, true); lh.setUint32(18, sz, true); lh.setUint32(22, sz, true); lh.setUint16(26, nm.length, true);
+      parts.push(new Uint8Array(lh.buffer), nm, f.data);
+      const ch = new DataView(new ArrayBuffer(46));
+      ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+      ch.setUint32(16, crc, true); ch.setUint32(20, sz, true); ch.setUint32(24, sz, true); ch.setUint16(28, nm.length, true);
+      ch.setUint32(42, off, true);
+      central.push(new Uint8Array(ch.buffer), nm);
+      off += 30 + nm.length + sz;
+    }
+    const csz = central.reduce((s, p) => s + p.length, 0);
+    const end = new DataView(new ArrayBuffer(22));
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+    end.setUint32(12, csz, true); end.setUint32(16, off, true);
+    const all = parts.concat(central, [new Uint8Array(end.buffer)]);
+    const total = all.reduce((s, p) => s + p.length, 0), out = new Uint8Array(total); let o = 0;
+    for (const p of all) { out.set(p, o); o += p.length; }
+    return out;
+  }
+
+  const DEFAULTS = {
+    artWidth: 30, rotation: 0, offX: 0, offY: 0, mirrorArt: true, medalRot: 0, fillRule: 'evenodd',
+    stroke: 0, invert: false, ring: 0, margin: 3,
+    frameType: 'none', frameRot: 0, frameR: 0, frameSize: 0, frameCount: 0, frameLines: false, frameGap: 1.2, frameClip: true,
+    reliefH: 0.8, steps: 4, draftDeg: 12, paper: 0.15, clearance: 0.15, extraDepth: 0.2,
+    baseT: 0, rim: 1.2, gap: 8
+  };
+
+  return { S, parseDXF, parseSVG, parseArt, rotateMedal, medalFromSTL, buildArtRegion, buildFrame, FRAME_TYPES, fitWidth, build, toSTL, zip, artBounds, offset, DEFAULTS };
+});
